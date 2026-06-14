@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+.env
+
+bert_results/
+checkpoints/
+*.pt
+*.pth
+*.safetensors
