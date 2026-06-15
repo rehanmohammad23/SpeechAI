@@ -26,22 +26,10 @@ text_scaler   = joblib.load('models/scaler_text.pkl')
 
 label_encoder = joblib.load('models/label_encoder.pkl')
 
-# Lazy-loaded models
-whisper_model = None
-tokenizer = None
-bert_model = None
+whisper_model = whisper.load_model("base")
 
-def load_ai_models():
-    global whisper_model, tokenizer, bert_model
-
-    if whisper_model is None:
-        whisper_model = whisper.load_model("tiny")
-
-    if tokenizer is None:
-        tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-
-    if bert_model is None:
-        bert_model = BertModel.from_pretrained("bert-base-uncased")
+tokenizer  = BertTokenizer.from_pretrained('bert-base-uncased')
+bert_model = BertModel.from_pretrained('bert-base-uncased')
 
 # ── AUDIO FEATURES ─────────────────────────────────────────────────────────────
 def extract_features(file_path):
@@ -92,18 +80,10 @@ def get_audio_detail_scores(file_path):
 
 # ── TEXT EMBEDDING ─────────────────────────────────────────────────────────────
 def get_embedding(text):
-    load_ai_models()
-
-    inputs = tokenizer(
-        text,
-        return_tensors='pt',
-        truncation=True,
-        padding=True
-    )
-
+    inputs  = tokenizer(text, return_tensors='pt', truncation=True, padding=True)
     outputs = bert_model(**inputs)
-
     return outputs.last_hidden_state[:, 0, :].detach().numpy()[0]
+
 # ── WAVEFORM ───────────────────────────────────────────────────────────────────
 def save_waveform(file_path):
     y, sr = librosa.load(file_path)
@@ -172,14 +152,72 @@ def index():
 
 @app.route('/predict', methods=['POST'])
 def predict():
-
-    load_ai_models()
-
-    file = request.files['audio']
+    file     = request.files['audio']
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
     file.save(filepath)
 
+    # ── Audio model ──
+    features        = extract_features(filepath).reshape(1, -1)
+    features_scaled = audio_scaler.transform(features)
+    audio_pred_idx  = audio_model.predict(features_scaled)[0]
+    audio_prob      = float(np.max(audio_model.predict_proba(features_scaled)))
+
+    # ── Whisper transcription ──
+    result = whisper_model.transcribe(filepath)
+    text   = result['text']
+
+    # ── Text model ──
+    embedding        = get_embedding(text).reshape(1, -1)
+    embedding_scaled = text_scaler.transform(embedding)
+    text_pred_idx    = text_model.predict(embedding_scaled)[0]
+    text_prob        = float(np.max(text_model.predict_proba(embedding_scaled)))
+
+    audio_pred = label_encoder.inverse_transform([audio_pred_idx])[0]
+    text_pred  = label_encoder.inverse_transform([text_pred_idx])[0]
+
+    # ── Final decision ──
+    final_pred = audio_pred if audio_prob > text_prob else text_pred
+
+    # ── CEFR ──
+    cefr_code, cefr_title, cefr_desc = get_cefr(final_pred)
+
+    # ── Detail scores from real audio ──
+    detail_scores = get_audio_detail_scores(filepath)
+
+    # ── Overall score (weighted avg of detail scores) ──
+    overall_score = int(
+        detail_scores["pronunciation"] * 0.30 +
+        detail_scores["fluency"]       * 0.30 +
+        detail_scores["grammar"]       * 0.25 +
+        detail_scores["vocabulary"]    * 0.15
+    )
+
+    # ── Visuals ──
+    waveform         = save_waveform(filepath)
+    confidence_chart = save_confidence_chart(audio_prob, text_prob)
+
+    # ── Recommendations as structured list ──
+    feedback = get_recommendation(audio_pred, text_pred, audio_prob, text_prob)
+
+    # ── Return JSON (consumed by index.html frontend) ──
+    return jsonify({
+        "score":       overall_score,
+        "level":       cefr_code,
+        "title":       cefr_title,
+        "desc":        cefr_desc,
+        "transcript":  text,
+        "audio_pred":  audio_pred,
+        "audio_prob":  round(audio_prob, 2),
+        "text_pred":   text_pred,
+        "text_prob":   round(text_prob, 2),
+        "final_pred":  final_pred,
+        "metrics":     detail_scores,
+        "feedback":    feedback,
+        "waveform":    "/" + waveform,
+        "confidence":  "/" + confidence_chart,
+    })
 
 
+# To this:
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=7860)  # HF Spaces uses port 7860
